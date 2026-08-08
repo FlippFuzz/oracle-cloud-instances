@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+preview = true
+select = ["D", "DOC", "E", "F", "I"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

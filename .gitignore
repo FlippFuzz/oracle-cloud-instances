@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+oci_config
+*.pem
+.logfire
+config.yaml

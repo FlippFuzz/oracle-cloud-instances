@@ -1,0 +1,4 @@
+oci==2.177.0
+pydantic
+pyyaml
+logfire

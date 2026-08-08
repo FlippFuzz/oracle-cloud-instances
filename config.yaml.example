@@ -1,0 +1,44 @@
+defaults:
+  ssh_auth_key: "ssh-ed25519 AAAAAAAAABBBBCCCCDDD ubuntu"
+  security_rules:
+    # Global Default Ingress Rules (applied to all subnets/instances)
+    - protocol: "6" # TCP
+      source: "0.0.0.0/0"
+      port: 22
+      description: "Default: Allow SSH IPv4"
+    - protocol: "6"
+      source: "::/0"
+      port: 22
+      description: "Default: Allow SSH IPv6"
+    - protocol: "1" # ICMPv4
+      source: "0.0.0.0/0"
+      description: "Default: Allow ICMPv4"
+    - protocol: "58" # IPv6-ICMP
+      source: "::/0"
+      description: "Default: Allow ICMPv6"
+
+accounts:
+  - name: "xxx"
+    servers:
+      - name: "yyyy"
+        shape: "VM.Standard.E5.Flex"
+        cpu: 8
+        ram: 64
+        swap: 4
+        disk: 100
+        reserved_ip: True
+        # Instance-Specific Ingress Rules
+        security_rules:
+          - protocol: "6" # TCP
+            source: "0.0.0.0/0"
+            port: 80
+            description: "Instance Specific: Allow HTTP IPv4"
+          - protocol: "6"
+            source: "0.0.0.0/0"
+            port_range:
+              min: 3000
+              max: 3010
+            description: "Instance Specific: Dev Port Range"
+        cronjobs:
+          - "*/5 * * * * curl -v https://ipv4.cloudns.net/api/dynamicURL/?q=XXXX > /var/log/cloudns.log 2>&1"
+          - "* * * * * echo 'LOGS!!!' >> /var/log/app.log"

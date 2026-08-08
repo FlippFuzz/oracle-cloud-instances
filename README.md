@@ -1,2 +1,3 @@
 # oracle-cloud-instances
-Scripts to manage OCI free tier instances
+
+My scripts to manage OCI free tier instances
