@@ -82,7 +82,9 @@ class Config(BaseModel):
             The updated Config instance.
         """
         if not self.defaults.security_rules:
-            self.defaults.security_rules = DEFAULT_RULES
+            # Copy, don't alias: DEFAULT_RULES is a shared module-level list, and assigning it
+            # directly would let a mutation on one Config's defaults leak into every other Config.
+            self.defaults.security_rules = list(DEFAULT_RULES)
 
         for account in self.accounts:
             for server in account.servers:
@@ -205,7 +207,8 @@ def get_latest_ubuntu_lts_image_id(compute_client: ComputeClient, compartment_id
         RuntimeError: If response is invalid or no compatible image is found.
     """
     try:
-        response = compute_client.list_images(
+        response = oci.pagination.list_call_get_all_results(
+            compute_client.list_images,
             compartment_id=compartment_id,
             shape=shape,
             operating_system="Canonical Ubuntu",

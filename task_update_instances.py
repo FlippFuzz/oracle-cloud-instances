@@ -78,11 +78,13 @@ if __name__ == "__main__":
                 if not isinstance(list_instance_result, oci.response.Response):
                     raise RuntimeError("Failed to list active OCI instances.")
 
-                # Retrieve all instances currently in transient or active states
+                # Retrieve all instances that already exist, i.e. anything not (or no longer) TERMINATED.
+                # This must include STOPPED (and transient states like STOPPING) so that a manually
+                # stopped instance isn't mistaken for missing and relaunched as a duplicate.
                 existing_instances = {
                     i.display_name: i.id
                     for i in list_instance_result.data
-                    if i.lifecycle_state in ["RUNNING", "PROVISIONING", "STARTING", "MOVING"]
+                    if i.lifecycle_state not in ["TERMINATED", "TERMINATING"]
                 }
 
                 for server in account_config.servers:

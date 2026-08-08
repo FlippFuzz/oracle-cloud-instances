@@ -98,6 +98,9 @@ if __name__ == "__main__":
                     except Exception as e:
                         logfire.warning(f"Could not list instances in compartment {comp_id}: {e}")
 
+                # Drop TERMINATED instances now so the emptiness check and both display loops agree
+                instances = [i for i in instances if i.lifecycle_state != "TERMINATED"]
+
                 if not instances:
                     print(f"\nAccount: {account_name}")
                     print(f"Compartment ID (Tenancy): {session.compartment_id}")
