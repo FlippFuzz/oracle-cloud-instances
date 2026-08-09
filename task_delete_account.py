@@ -469,5 +469,5 @@ def main():
 
 
 if __name__ == "__main__":
-    logfire.configure(send_to_logfire="if-token-present")
+    logfire.configure(send_to_logfire="if-token-present", scrubbing=False)
     main()

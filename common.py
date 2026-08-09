@@ -1,5 +1,6 @@
 """Common helper utilities, data models, and OCI client wrappers."""
 
+import inspect
 import time
 from typing import Dict, List, Optional
 
@@ -15,10 +16,26 @@ from oci.core import (
 from oci.identity import IdentityClient
 from oci.work_requests import WorkRequestClient
 from pydantic import BaseModel, ConfigDict, model_validator
+from pyrate_limiter import Duration, limiter_factory
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from yaml import safe_load
 
 CONFIG_FILE = "config.yaml"
 OCI_CONFIG_FILE = "oci_config"
+
+# --- OCI client rate limiting / retry configuration ---
+_OCI_RATE_LIMIT_PER_SECOND = 1
+_OCI_RETRY_MAX_ATTEMPTS = 5
+_OCI_RETRY_WAIT_MIN_SECONDS = 2
+_OCI_RETRY_WAIT_MAX_SECONDS = 30
+
+if _OCI_RATE_LIMIT_PER_SECOND >= 1:
+    _rate = int(_OCI_RATE_LIMIT_PER_SECOND)
+    _duration = Duration.SECOND
+else:
+    _rate = 1
+    _duration = int(Duration.SECOND * (1 / _OCI_RATE_LIMIT_PER_SECOND))
+_oci_limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=_rate, duration=_duration)
 
 
 class PortRangeConfig(BaseModel):
@@ -82,8 +99,6 @@ class Config(BaseModel):
             The updated Config instance.
         """
         if not self.defaults.security_rules:
-            # Copy, don't alias: DEFAULT_RULES is a shared module-level list, and assigning it
-            # directly would let a mutation on one Config's defaults leak into every other Config.
             self.defaults.security_rules = list(DEFAULT_RULES)
 
         for account in self.accounts:
@@ -91,6 +106,59 @@ class Config(BaseModel):
                 if server.ssh_auth_key is None:
                     server.ssh_auth_key = self.defaults.ssh_auth_key
         return self
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Check whether an exception represents an OCI 429 TooManyRequests response.
+
+    Args:
+        exc: The exception raised by an OCI API call.
+
+    Returns:
+        True if the exception is an OCI 429 rate-limit error.
+    """
+    return isinstance(exc, oci.exceptions.ServiceError) and exc.status == 429
+
+
+def _rate_limit_and_retry(func):
+    """Wrap an OCI client method with shared rate limiting and 429 retry/backoff.
+
+    Args:
+        func: The bound OCI client method to wrap.
+
+    Returns:
+        A wrapped version of func with rate limiting and 429 retry applied.
+    """
+
+    @retry(
+        retry=retry_if_exception(_is_rate_limited),
+        stop=stop_after_attempt(_OCI_RETRY_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=_OCI_RETRY_WAIT_MIN_SECONDS, max=_OCI_RETRY_WAIT_MAX_SECONDS),
+        reraise=True,
+    )
+    def wrapped(*args, **kwargs):
+        _oci_limiter.try_acquire("oci")
+        return func(*args, **kwargs)
+
+    return wrapped
+
+
+def apply_rate_limiting(client):
+    """Patch every public method on an OCI client with rate limiting and 429 retry.
+
+    Args:
+        client: An OCI service client instance (e.g. ComputeClient).
+
+    Returns:
+        The same client instance, with its public methods wrapped in place.
+    """
+    for name in dir(client):
+        if name.startswith("_"):
+            continue
+        attr = getattr(client, name)
+        if inspect.ismethod(attr):
+            setattr(client, name, _rate_limit_and_retry(attr))
+    return client
 
 
 class AccountSession(BaseModel):
@@ -109,8 +177,8 @@ class AccountSession(BaseModel):
     virtual_network_composite_operations: VirtualNetworkClientCompositeOperations
 
     compartment_id: str
-    subnet_id: Optional[str] = None  # Resolved and stored during the network audit phase
-    nsg_ids: Dict[str, str] = {}  # Map server_name -> nsg_id
+    subnet_id: Optional[str] = None
+    nsg_ids: Dict[str, str] = {}
 
     @classmethod
     def from_account(cls, account_name: str, oci_config_path: str) -> "AccountSession":
@@ -128,11 +196,11 @@ class AccountSession(BaseModel):
         """
         config = oci.config.from_file(oci_config_path, account_name)
 
-        identity_client = oci.identity.IdentityClient(config)
-        compute_client = oci.core.ComputeClient(config)
-        virtual_network_client = oci.core.VirtualNetworkClient(config)
-        block_storage_client = oci.core.BlockstorageClient(config)
-        work_request_client = oci.work_requests.WorkRequestClient(config)
+        identity_client = apply_rate_limiting(oci.identity.IdentityClient(config))
+        compute_client = apply_rate_limiting(oci.core.ComputeClient(config))
+        virtual_network_client = apply_rate_limiting(oci.core.VirtualNetworkClient(config))
+        block_storage_client = apply_rate_limiting(oci.core.BlockstorageClient(config))
+        work_request_client = apply_rate_limiting(oci.work_requests.WorkRequestClient(config))
         compute_client_composite_operations = oci.core.ComputeClientCompositeOperations(compute_client)
         virtual_network_composite_operations = oci.core.VirtualNetworkClientCompositeOperations(virtual_network_client)
 
@@ -266,15 +334,68 @@ def get_latest_ubuntu_lts_image_id(compute_client: ComputeClient, compartment_id
     return lts_images[0].id
 
 
-def get_availability_domain(identity_client: IdentityClient, compartment_id: str) -> str:
-    """Retrieve the first available availability domain for a compartment.
+def get_supported_shapes_by_ad(
+    identity_client: IdentityClient,
+    compute_client: ComputeClient,
+    compartment_id: str,
+) -> Dict[str, set]:
+    """Query all availability domains in a compartment and return a mapping of AD name to supported shapes.
+
+    Args:
+        identity_client: OCI IdentityClient instance.
+        compute_client: OCI ComputeClient instance.
+        compartment_id: OCID of the compartment.
+
+    Returns:
+        A dictionary mapping each Availability Domain name to a set of supported shape names.
+    """
+    ads_response = identity_client.list_availability_domains(compartment_id=compartment_id)
+    if not isinstance(ads_response, oci.response.Response) or not ads_response.data:
+        logfire.warning(f"Could not list availability domains for compartment {compartment_id}")
+        return {}
+
+    shapes_by_ad: Dict[str, set] = {}
+    for ad in ads_response.data:
+        shapes_by_ad[ad.name] = set()
+        try:
+            shapes_response = oci.pagination.list_call_get_all_results(
+                compute_client.list_shapes,
+                compartment_id=compartment_id,
+                availability_domain=ad.name,
+            )
+            if isinstance(shapes_response, oci.response.Response) and shapes_response.data:
+                shapes_by_ad[ad.name] = {s.shape for s in shapes_response.data}
+        except Exception as e:
+            logfire.warning(f"Failed to list shapes for AD '{ad.name}': {e}")
+
+    debug_payload = {ad_name: sorted(list(shapes)) for ad_name, shapes in shapes_by_ad.items()}
+    logfire.debug(
+        "Discovered supported shapes per Availability Domain",
+        compartment_id=compartment_id,
+        shapes_by_ad=debug_payload,
+    )
+
+    return shapes_by_ad
+
+
+def get_availability_domain(
+    identity_client: IdentityClient,
+    compartment_id: str,
+    compute_client: Optional[ComputeClient] = None,
+    shape: Optional[str] = None,
+    shapes_by_ad: Optional[Dict[str, set]] = None,
+) -> str:
+    """Retrieve an availability domain for a compartment, optionally filtering by shape support.
 
     Args:
         identity_client: OCI IdentityClient instance.
         compartment_id: OCID of the compartment.
+        compute_client: Optional OCI ComputeClient instance to check shape availability.
+        shape: Optional compute shape string to filter availability domains.
+        shapes_by_ad: Optional pre-fetched map of AD name to set of supported shapes.
 
     Returns:
-        The name of the availability domain.
+        The name of the availability domain that supports the specified shape or the first available AD.
 
     Raises:
         RuntimeError: If listing availability domains fails or none are found.
@@ -285,6 +406,27 @@ def get_availability_domain(identity_client: IdentityClient, compartment_id: str
     ads = response.data
     if not ads:
         raise RuntimeError(f"No availability domains found for compartment {compartment_id}")
+
+    if shape:
+        if shapes_by_ad:
+            for ad in ads:
+                if shape in shapes_by_ad.get(ad.name, set()):
+                    logfire.info(f"Selected Availability Domain '{ad.name}' matching shape '{shape}'.")
+                    return ad.name
+
+        if compute_client:
+            for ad in ads:
+                try:
+                    shapes_response = compute_client.list_shapes(
+                        compartment_id=compartment_id, availability_domain=ad.name
+                    )
+                    if isinstance(shapes_response, oci.response.Response) and shapes_response.data:
+                        if any(s.shape == shape for s in shapes_response.data):
+                            logfire.info(f"Selected Availability Domain '{ad.name}' matching shape '{shape}'.")
+                            return ad.name
+                except Exception as e:
+                    logfire.warning(f"Could not check shape availability in AD '{ad.name}': {e}")
+
     return ads[0].name
 
 
@@ -365,7 +507,6 @@ def sync_nsg_security_rules(
     """
     logfire.info(f"Synchronizing active rules on Network Security Group: {nsg_id}...")
 
-    # 1. Fetch current rules
     rules_response = virtual_network_client.list_network_security_group_security_rules(nsg_id)
     if not isinstance(rules_response, oci.response.Response):
         raise RuntimeError(f"Failed to list rules for NSG {nsg_id}")
@@ -373,14 +514,12 @@ def sync_nsg_security_rules(
     existing_rules = rules_response.data
     existing_rule_ids = [r.id for r in existing_rules]
 
-    # 2. Purge current rules
     if existing_rule_ids:
         remove_details = oci.core.models.RemoveNetworkSecurityGroupSecurityRulesDetails(
             security_rule_ids=existing_rule_ids
         )
         virtual_network_client.remove_network_security_group_security_rules(nsg_id, remove_details)
 
-    # 3. Compile ingress structures
     new_rules = []
     for r in ingress_rules_config:
         tcp_options = None
@@ -414,7 +553,6 @@ def sync_nsg_security_rules(
         )
         new_rules.append(rule_detail)
 
-    # 4. Standard hardcoded full outbound rules
     egress_ipv4 = oci.core.models.AddSecurityRuleDetails(
         direction="EGRESS",
         protocol="all",
@@ -431,7 +569,6 @@ def sync_nsg_security_rules(
     )
     new_rules.extend([egress_ipv4, egress_ipv6])
 
-    # 5. Apply synchronized payload
     if new_rules:
         add_details = oci.core.models.AddNetworkSecurityGroupSecurityRulesDetails(security_rules=new_rules)
         virtual_network_client.add_network_security_group_security_rules(nsg_id, add_details)
@@ -479,7 +616,6 @@ def setup_internet_routing(
             raise RuntimeError("Failed to create Internet Gateway payload.")
         igw = igw_response.data
 
-    # Append routes to the VCN's default route table
     vcn_response = virtual_network_client.get_vcn(vcn_id)
     if not isinstance(vcn_response, oci.response.Response):
         raise RuntimeError(f"Failed to fetch VCN payload for routing rules sync on VCN ID {vcn_id}")
@@ -492,7 +628,6 @@ def setup_internet_routing(
 
     route_rules = rt.route_rules or []
 
-    # Robust property check mapping both historical and modern SDK models (cidr_block vs destination)
     has_ipv4_rule = any(
         (getattr(rule, "destination", None) == "0.0.0.0/0" or getattr(rule, "cidr_block", None) == "0.0.0.0/0")
         for rule in route_rules
@@ -522,7 +657,6 @@ def setup_internet_routing(
     if not has_ipv4_rule or not has_ipv6_rule:
         logfire.info("Updating VCN Route Table with standard IPv4/IPv6 destination rules...")
         update_rt_details = oci.core.models.UpdateRouteTableDetails(route_rules=route_rules)
-        # Invoke update_route_table method directly to bind routing configuration
         virtual_network_client.update_route_table(vcn_details.default_route_table_id, update_rt_details)
 
 
@@ -579,7 +713,6 @@ def get_or_create_ipv6_subnet(
                 raise RuntimeError(f"Failed to reload Subnet details for Subnet ID {subnet.id}")
             subnet = subnet_response.data
 
-        # Explicitly align and audit internet gateway and routing on every run, even for existing subnets
         try:
             setup_internet_routing(virtual_network_client, compartment_id, vcn.id, subnet)
         except Exception as e:
@@ -732,7 +865,6 @@ def allocate_maximum_ipv6_addresses(
         if not isinstance(ipv6s_response, oci.response.Response):
             raise RuntimeError("Failed to list existing IPv6 addresses.")
 
-        # Count all assigned IPv6 allocations
         existing_count = len(ipv6s_response.data)
         logfire.info(f"VNIC {vnic_id} currently has {existing_count} total IPv6 addresses allocated.")
     except Exception as e:
@@ -748,10 +880,6 @@ def allocate_maximum_ipv6_addresses(
 
     allocated = 0
     for i in range(needed_count):
-        # Throttle requests: sleep 1.5 seconds between each API call to avoid token-bucket rate limits (429s)
-        if i > 0:
-            time.sleep(1.5)
-
         try:
             create_details = oci.core.models.CreateIpv6Details(
                 vnic_id=vnic_id,
@@ -806,7 +934,6 @@ def get_instance_ips_and_nsgs(
                     if vnic.public_ip:
                         ipv4_addresses.append(vnic.public_ip)
 
-                    # Extract associated NSG IDs bound to this VNIC
                     if vnic.nsg_ids:
                         nsg_ids.extend(vnic.nsg_ids)
 
@@ -815,7 +942,6 @@ def get_instance_ips_and_nsgs(
                         for ipv6 in ipv6s_response.data:
                             ipv6_addresses.append(ipv6.ip_address)
 
-                    # Query OCI public IP metadata to evaluate if this address is RESERVED or EPHEMERAL
                     private_ips_response = virtual_network_client.list_private_ips(vnic_id=attachment.vnic_id)
                     if isinstance(private_ips_response, oci.response.Response) and private_ips_response.data:
                         primary_private_ip_id = private_ips_response.data[0].id
@@ -825,7 +951,7 @@ def get_instance_ips_and_nsgs(
                             )
                             public_ip_response = virtual_network_client.get_public_ip_by_private_ip_id(details)
                             if isinstance(public_ip_response, oci.response.Response):
-                                ipv4_type = public_ip_response.data.lifetime  # returns "RESERVED" or "EPHEMERAL"
+                                ipv4_type = public_ip_response.data.lifetime
                         except oci.exceptions.ServiceError as se:
                             if se.status != 404:
                                 raise
@@ -1004,7 +1130,6 @@ def ensure_reserved_public_ip(
         if e.status != 404:
             raise
 
-    # Acquire available/new reserved IP and assign it
     public_ip_id = get_or_create_reserved_public_ip(virtual_network_client, compartment_id)
     assign_reserved_public_ip(virtual_network_client, public_ip_id, private_ip_id)
 

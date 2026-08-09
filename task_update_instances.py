@@ -1,6 +1,7 @@
 """Script to deploy and update OCI compute instances and network security configurations."""
 
 import base64
+import random
 import time
 from textwrap import dedent
 
@@ -20,19 +21,24 @@ from common import (
     get_primary_private_ip_id,
     get_primary_vnic_id_with_retry,
     get_subnet_id,
+    get_supported_shapes_by_ad,
     load_config,
     log_detailed_service_error,
     merge_server_rules,
     sync_nsg_security_rules,
 )
 
+INSTANCE_CREATION_SLEEP_MIN = 60
+INSTANCE_CREATION_SLEEP_MAX = 120
+
 if __name__ == "__main__":
-    logfire.configure(send_to_logfire="if-token-present")
+    logfire.configure(send_to_logfire="if-token-present", scrubbing=False)
 
     with logfire.span("Loading config file"):
         config = load_config()
 
     sessions: dict[str, AccountSession] = {}
+    session_supported_shapes: dict[str, dict[str, set]] = {}
     needs_work: list[tuple[str, ServerConfig]] = []
 
     with logfire.span("Setting up network and checking state"):
@@ -51,7 +57,6 @@ if __name__ == "__main__":
                 )
                 session.subnet_id = subnet_id
 
-                # Resolve current VCN ID
                 subnet_response = session.virtual_network_client.get_subnet(subnet_id)
                 if not isinstance(subnet_response, oci.response.Response):
                     raise RuntimeError("Failed to retrieve subnet details for NSG parent association.")
@@ -67,20 +72,25 @@ if __name__ == "__main__":
                     )
                     session.nsg_ids[server.name] = nsg_id
 
-                    # Merge global defaults + server specific rules, then sync directly to NSG
                     merged_rules = merge_server_rules(server, config.defaults.security_rules)
                     sync_nsg_security_rules(session.virtual_network_client, nsg_id, merged_rules)
 
-                # 3. Determine if any instances require deployment or IPv6 self-healing
+                # 3. Pre-flight check: Audit supported shapes across all Availability Domains (stored as logfire debug)
+                supported_shapes_by_ad = get_supported_shapes_by_ad(
+                    session.identity_client, session.compute_client, session.compartment_id
+                )
+                session_supported_shapes[account_name] = supported_shapes_by_ad
+                all_supported_shapes = (
+                    set().union(*supported_shapes_by_ad.values()) if supported_shapes_by_ad else set()
+                )
+
+                # 4. Determine if any instances require deployment or IPv6 self-healing
                 list_instance_result = oci.pagination.list_call_get_all_results(
                     session.compute_client.list_instances, session.compartment_id
                 )
                 if not isinstance(list_instance_result, oci.response.Response):
                     raise RuntimeError("Failed to list active OCI instances.")
 
-                # Retrieve all instances that already exist, i.e. anything not (or no longer) TERMINATED.
-                # This must include STOPPED (and transient states like STOPPING) so that a manually
-                # stopped instance isn't mistaken for missing and relaunched as a duplicate.
                 existing_instances = {
                     i.display_name: i.id
                     for i in list_instance_result.data
@@ -89,9 +99,15 @@ if __name__ == "__main__":
 
                 for server in account_config.servers:
                     if server.name not in existing_instances:
-                        needs_work.append((account_name, server))
+                        # Skip servers whose shapes are not supported in any AD for this account
+                        if all_supported_shapes and server.shape not in all_supported_shapes:
+                            logfire.warning(
+                                f"Shape '{server.shape}' for server '{server.name}' is not supported in any "
+                                f"Availability Domain on account '{account_name}'. Skipping instance creation."
+                            )
+                        else:
+                            needs_work.append((account_name, server))
                     else:
-                        # Self-healing: Audit IPv6 block allocations and reserved IP bindings on already running servers
                         instance_id = existing_instances[server.name]
                         logfire.info(
                             f"Instance '{server.name}' is already running. Auditing IPv6 and IP configuration..."
@@ -104,10 +120,8 @@ if __name__ == "__main__":
                                 max_retries=3,
                             )
 
-                            # Audit IPv6 assignments
                             allocate_maximum_ipv6_addresses(session.virtual_network_client, vnic_id)
 
-                            # Audit Reserved IP binding
                             if server.reserved_ip:
                                 logfire.info(
                                     f"Instance '{server.name}' is configured for reserved IPv4. Auditing mapping..."
@@ -121,7 +135,7 @@ if __name__ == "__main__":
                         except Exception as e:
                             logfire.warning(f"Could not automatically audit/heal instance '{server.name}': {e}")
 
-                pending_names = [s.name for s in account_config.servers if s.name not in existing_instances]
+                pending_names = [s.name for _, s in needs_work if s.name not in existing_instances]
                 logfire.info(f"Instances pending creation for {account_name}: {pending_names}")
 
     with logfire.span("Working on instances"):
@@ -134,9 +148,14 @@ if __name__ == "__main__":
 
                 with logfire.span(f"Creating instance {server.name} on {account_name}"):
                     try:
-                        ad = get_availability_domain(session.identity_client, session.compartment_id)
+                        ad = get_availability_domain(
+                            session.identity_client,
+                            session.compartment_id,
+                            compute_client=session.compute_client,
+                            shape=server.shape,
+                            shapes_by_ad=session_supported_shapes.get(account_name),
+                        )
 
-                        # Use the cached subnet_id, falling back to a direct lookup if necessary
                         subnet_id = session.subnet_id
                         if not subnet_id:
                             subnet_id = get_subnet_id(session.virtual_network_client, session.compartment_id)
@@ -153,7 +172,6 @@ if __name__ == "__main__":
 
                         metadata = {"ssh_authorized_keys": server.ssh_auth_key}
 
-                        # Build unified cloud-init user_data script if swap or cronjobs are configured
                         user_data_parts = []
 
                         if server.swap > 0:
@@ -173,7 +191,6 @@ if __name__ == "__main__":
 
                         if server.cronjobs:
                             cron_entries = "\n".join(server.cronjobs)
-                            # Dedent the static part first, then format with cron entries
                             cron_block_template = dedent("""\
                                 # Configure custom cronjobs
                                 TMP_CRON=$(mktemp)
@@ -191,7 +208,6 @@ if __name__ == "__main__":
                             full_script = "#!/bin/bash\n" + "\n".join(user_data_parts)
                             metadata["user_data"] = base64.b64encode(full_script.encode("utf-8")).decode("utf-8")
 
-                        # Pull the NSG ID resolved during Phase 1 configuration audit
                         nsg_id = session.nsg_ids.get(server.name)
                         nsg_ids = [nsg_id] if nsg_id else []
 
@@ -203,10 +219,9 @@ if __name__ == "__main__":
                             shape_config=shape_config,
                             create_vnic_details=oci.core.models.CreateVnicDetails(
                                 subnet_id=subnet_id,
-                                # Prevents ephemeral IPv4 allocation if reserved IP is targeted
                                 assign_public_ip=not server.reserved_ip,
                                 assign_ipv6_ip=True,
-                                nsg_ids=nsg_ids,  # Binds the instance directly to its dedicated NSG
+                                nsg_ids=nsg_ids,
                             ),
                             metadata=metadata,
                             source_details=oci.core.models.InstanceSourceViaImageDetails(
@@ -216,7 +231,7 @@ if __name__ == "__main__":
                             ),
                         )
 
-                        logfire.info(f"Sending request to launch {server.name} ({server.shape})...")
+                        logfire.info(f"Sending request to launch {server.name} ({server.shape}) in {ad}...")
                         response = session.compute_client.launch_instance(launch_details)
                         if not isinstance(response, oci.response.Response):
                             raise RuntimeError(f"Failed to retrieve launch response payload for instance {server.name}")
@@ -227,7 +242,6 @@ if __name__ == "__main__":
                             session.compute_client, session.compartment_id, instance.id
                         )
 
-                        # Dynamically assign and wait on the reserved public IP if targeted
                         if server.reserved_ip:
                             private_ip_id = get_primary_private_ip_id(session.virtual_network_client, vnic_id)
                             ensure_reserved_public_ip(
@@ -236,7 +250,6 @@ if __name__ == "__main__":
                                 private_ip_id,
                             )
 
-                        # Wait briefly for primary VNIC to generate, then allocate maximum secondary IPv6 block
                         try:
                             allocate_maximum_ipv6_addresses(session.virtual_network_client, vnic_id)
                         except Exception as e:
@@ -245,14 +258,10 @@ if __name__ == "__main__":
                         needs_work.remove((account_name, server))
 
                     except oci.exceptions.ServiceError as e:
-                        # Log the detailed OCI error directly
                         log_detailed_service_error(e, server.name, "launch_instance")
 
                         is_retryable = (
-                            e.status in [429, 500, 503]
-                            or "capacity" in str(e).lower()
-                            or "limit" in str(e).lower()
-                            or "authorization failed" in str(e).lower()
+                            e.status in [429, 500, 503] or "capacity" in str(e).lower() or "limit" in str(e).lower()
                         )
                         if is_retryable:
                             logfire.warning(
@@ -264,10 +273,13 @@ if __name__ == "__main__":
                     except Exception as e:
                         logfire.error(f"Unexpected error when creating {server.name} on {account_name}: {e}. Retrying.")
 
+                if len(needs_work) > 0:
+                    sleep_time = random.randint(INSTANCE_CREATION_SLEEP_MIN, INSTANCE_CREATION_SLEEP_MAX)
+                    logfire.info(f"Sleeping for {sleep_time}s before next instance...")
+                    time.sleep(sleep_time)
+
             if len(needs_work) > 0:
                 attempt += 1
-                wait_time = 60
-                logfire.info(f"Still pending {len(needs_work)} instances. Waiting {wait_time}s before next attempt...")
-                time.sleep(wait_time)
+                logfire.info(f"Still pending {len(needs_work)} instances. Starting next deployment pass...")
 
         logfire.info("Completed setup of all requested instances.")

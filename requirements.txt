@@ -1,4 +1,6 @@
-oci==2.177.0
+oci
 pydantic
 pyyaml
 logfire
+pyrate-limiter
+tenacity
