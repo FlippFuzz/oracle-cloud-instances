@@ -220,4 +220,5 @@ __marimo__/
 oci_config
 *.pem
 .logfire
+configs/
 config.yaml

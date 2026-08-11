@@ -12,6 +12,39 @@ from common import (
 )
 
 
+def _protocol_and_ports(protocol: str, tcp_options, udp_options) -> tuple[str, str]:
+    """Resolve a human-readable protocol name and port description for a security rule.
+
+    Args:
+        protocol: OCI protocol number string (e.g. "6", "17", "1", "58", "all").
+        tcp_options: TCP options object from the rule, or None.
+        udp_options: UDP options object from the rule, or None.
+
+    Returns:
+        A tuple of (protocol_name, port_description).
+    """
+    protocol_map = {
+        "6": "TCP",
+        "17": "UDP",
+        "1": "ICMP",
+        "58": "ICMPv6",
+        "all": "All Protocols",
+    }
+    proto = protocol_map.get(protocol, f"Proto {protocol}")
+
+    ports = "All Ports"
+    if protocol == "6" and tcp_options:
+        r = tcp_options.destination_port_range
+        if r:
+            ports = f"Port {r.min}" if r.min == r.max else f"Ports {r.min}-{r.max}"
+    elif protocol == "17" and udp_options:
+        r = udp_options.destination_port_range
+        if r:
+            ports = f"Port {r.min}" if r.min == r.max else f"Ports {r.min}-{r.max}"
+
+    return proto, ports
+
+
 def format_security_rule(rule) -> str:
     """Convert a native OCI NSG SecurityRule model into human-readable text.
 
@@ -24,27 +57,80 @@ def format_security_rule(rule) -> str:
     if rule.direction == "EGRESS":
         return f"Allow Outbound traffic to {rule.destination} [Protocol: {rule.protocol}]"
 
-    protocol_map = {
-        "6": "TCP",
-        "17": "UDP",
-        "1": "ICMP",
-        "58": "ICMPv6",
-        "all": "All Protocols",
-    }
-    proto = protocol_map.get(rule.protocol, f"Proto {rule.protocol}")
-
-    ports = "All Ports"
-    if rule.protocol == "6" and rule.tcp_options:
-        r = rule.tcp_options.destination_port_range
-        if r:
-            ports = f"Port {r.min}" if r.min == r.max else f"Ports {r.min}-{r.max}"
-    elif rule.protocol == "17" and rule.udp_options:
-        r = rule.udp_options.destination_port_range
-        if r:
-            ports = f"Port {r.min}" if r.min == r.max else f"Ports {r.min}-{r.max}"
-
+    proto, ports = _protocol_and_ports(rule.protocol, rule.tcp_options, rule.udp_options)
     desc = f" [{rule.description}]" if rule.description else ""
     return f"Allow {proto} from {rule.source} on {ports}{desc}"
+
+
+def format_security_list_rule(rule, direction: str) -> str:
+    """Convert an OCI Security List ingress/egress rule into human-readable text.
+
+    Args:
+        rule: OCI IngressSecurityRule or EgressSecurityRule object.
+        direction: Either "INGRESS" or "EGRESS", since the OCI SDK returns these
+            as two separate lists without a direction field on the rule itself.
+
+    Returns:
+        Human-readable representation of the security rule.
+    """
+    if direction == "EGRESS":
+        return f"Allow Outbound traffic to {rule.destination} [Protocol: {rule.protocol}]"
+
+    proto, ports = _protocol_and_ports(rule.protocol, rule.tcp_options, rule.udp_options)
+    desc = f" [{rule.description}]" if rule.description else ""
+    return f"Allow {proto} from {rule.source} on {ports}{desc}"
+
+
+def get_instance_subnet_ids(compute_client, virtual_network_client, compartment_id: str, instance_id: str) -> list:
+    """Retrieve the distinct subnet OCIDs backing an instance's VNIC attachments.
+
+    Args:
+        compute_client: OCI ComputeClient instance.
+        virtual_network_client: OCI VirtualNetworkClient instance.
+        compartment_id: OCID of the compartment.
+        instance_id: OCID of the compute instance.
+
+    Returns:
+        A list of unique subnet OCIDs used by the instance's VNICs, in discovery order.
+    """
+    subnet_ids = []
+    try:
+        attachments_response = oci.pagination.list_call_get_all_results(
+            compute_client.list_vnic_attachments,
+            compartment_id=compartment_id,
+            instance_id=instance_id,
+        )
+        if isinstance(attachments_response, oci.response.Response):
+            for attachment in attachments_response.data:
+                vnic_response = virtual_network_client.get_vnic(attachment.vnic_id)
+                if isinstance(vnic_response, oci.response.Response) and vnic_response.data.subnet_id:
+                    subnet_ids.append(vnic_response.data.subnet_id)
+    except Exception as e:
+        logfire.warning(f"Failed to resolve subnet(s) for instance {instance_id}: {e}")
+    return list(dict.fromkeys(subnet_ids))
+
+
+def get_security_lists_for_subnet(virtual_network_client, subnet_id: str) -> list:
+    """Retrieve the Security List objects attached to a subnet.
+
+    Args:
+        virtual_network_client: OCI VirtualNetworkClient instance.
+        subnet_id: OCID of the subnet.
+
+    Returns:
+        A list of OCI SecurityList objects attached to the subnet.
+    """
+    security_lists = []
+    try:
+        subnet_response = virtual_network_client.get_subnet(subnet_id)
+        if isinstance(subnet_response, oci.response.Response):
+            for sl_id in subnet_response.data.security_list_ids or []:
+                sl_response = virtual_network_client.get_security_list(sl_id)
+                if isinstance(sl_response, oci.response.Response):
+                    security_lists.append(sl_response.data)
+    except Exception as e:
+        logfire.warning(f"Failed to resolve security lists for subnet {subnet_id}: {e}")
+    return security_lists
 
 
 if __name__ == "__main__":
@@ -203,6 +289,43 @@ if __name__ == "__main__":
                             )
                             print("   " + "-" * 80)
                     print("  " + "=" * 85)
+
+                # Fetch and display the effective Security List rules for each subnet in use.
+                # These apply in addition to (not instead of) any NSG rules shown above.
+                if instances:
+                    subnet_instance_names: dict[str, list[str]] = {}
+                    for inst in instances:
+                        if inst.lifecycle_state == "TERMINATED":
+                            continue
+                        for subnet_id in get_instance_subnet_ids(
+                            session.compute_client, session.virtual_network_client, inst.compartment_id, inst.id
+                        ):
+                            subnet_instance_names.setdefault(subnet_id, []).append(inst.display_name)
+
+                    if subnet_instance_names:
+                        print("\n  Active Subnet Security List Rules (apply in addition to any NSG rules above):")
+                        print("  " + "=" * 85)
+                        for subnet_id, instance_names in subnet_instance_names.items():
+                            subnet_response = session.virtual_network_client.get_subnet(subnet_id)
+                            subnet_name = (
+                                subnet_response.data.display_name
+                                if isinstance(subnet_response, oci.response.Response)
+                                else subnet_id
+                            )
+
+                            print(f"   Subnet: {subnet_name} (Instances: {', '.join(instance_names)})")
+
+                            security_lists = get_security_lists_for_subnet(session.virtual_network_client, subnet_id)
+                            if not security_lists:
+                                print("     (No Security Lists found)")
+                            for sl in security_lists:
+                                print(f"     Security List: {sl.display_name}")
+                                for rule in sl.ingress_security_rules:
+                                    print(f"       * {format_security_list_rule(rule, 'INGRESS')}")
+                                for rule in sl.egress_security_rules:
+                                    print(f"       * {format_security_list_rule(rule, 'EGRESS')}")
+                            print("   " + "-" * 80)
+                        print("  " + "=" * 85)
 
             except Exception as e:
                 logfire.error(f"Could not process account {account_name}: {e}")
