@@ -25,11 +25,12 @@ from common import (
     load_config,
     log_detailed_service_error,
     merge_server_rules,
+    sync_instance_nsg_assignment,
     sync_nsg_security_rules,
 )
 
-INSTANCE_CREATION_SLEEP_MIN = 60
-INSTANCE_CREATION_SLEEP_MAX = 120
+INSTANCE_CREATION_SLEEP_MIN = 90
+INSTANCE_CREATION_SLEEP_MAX = 150
 
 if __name__ == "__main__":
     logfire.configure(send_to_logfire="if-token-present", scrubbing=False)
@@ -121,6 +122,16 @@ if __name__ == "__main__":
                             )
 
                             allocate_maximum_ipv6_addresses(session.virtual_network_client, vnic_id)
+
+                            nsg_id = session.nsg_ids.get(server.name)
+                            if nsg_id:
+                                logfire.info(
+                                    f"Instance '{server.name}' is configured for NSG management. "
+                                    "Auditing NSG assignment..."
+                                )
+                                sync_instance_nsg_assignment(
+                                    session.virtual_network_client, vnic_id, nsg_id, instance_label=server.name
+                                )
 
                             if server.reserved_ip:
                                 logfire.info(

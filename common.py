@@ -24,7 +24,7 @@ CONFIG_FILE = "config.yaml"
 OCI_CONFIG_FILE = "oci_config"
 
 # --- OCI client rate limiting / retry configuration ---
-_OCI_RATE_LIMIT_PER_SECOND = 1
+_OCI_RATE_LIMIT_PER_SECOND = 0.25
 _OCI_RETRY_MAX_ATTEMPTS = 5
 _OCI_RETRY_WAIT_MIN_SECONDS = 2
 _OCI_RETRY_WAIT_MAX_SECONDS = 30
@@ -490,6 +490,25 @@ def get_or_create_nsg(
     return response.data.id
 
 
+def _get_nsg_display_name(virtual_network_client: VirtualNetworkClient, nsg_id: str) -> str:
+    """Best-effort lookup of a Network Security Group's display name.
+
+    Args:
+        virtual_network_client: OCI VirtualNetworkClient instance.
+        nsg_id: OCID of the Network Security Group.
+
+    Returns:
+        The NSG's display name, or its OCID if the name cannot be retrieved.
+    """
+    try:
+        response = virtual_network_client.get_network_security_group(nsg_id)
+        if isinstance(response, oci.response.Response) and response.data.display_name:
+            return response.data.display_name
+    except Exception as e:
+        logfire.warning(f"Could not resolve display name for NSG {nsg_id}: {e}")
+    return nsg_id
+
+
 def sync_nsg_security_rules(
     virtual_network_client: VirtualNetworkClient,
     nsg_id: str,
@@ -505,11 +524,12 @@ def sync_nsg_security_rules(
     Raises:
         RuntimeError: If fetching NSG rules fails.
     """
-    logfire.info(f"Synchronizing active rules on Network Security Group: {nsg_id}...")
+    nsg_display_name = _get_nsg_display_name(virtual_network_client, nsg_id)
+    logfire.info(f"Synchronizing active rules on Network Security Group '{nsg_display_name}'...")
 
     rules_response = virtual_network_client.list_network_security_group_security_rules(nsg_id)
     if not isinstance(rules_response, oci.response.Response):
-        raise RuntimeError(f"Failed to list rules for NSG {nsg_id}")
+        raise RuntimeError(f"Failed to list rules for NSG '{nsg_display_name}' ({nsg_id})")
 
     existing_rules = rules_response.data
     existing_rule_ids = [r.id for r in existing_rules]
@@ -572,7 +592,66 @@ def sync_nsg_security_rules(
     if new_rules:
         add_details = oci.core.models.AddNetworkSecurityGroupSecurityRulesDetails(security_rules=new_rules)
         virtual_network_client.add_network_security_group_security_rules(nsg_id, add_details)
-        logfire.info("NSG security rules successfully synchronized.")
+        logfire.info(f"NSG '{nsg_display_name}' security rules successfully synchronized.")
+
+
+def sync_instance_nsg_assignment(
+    virtual_network_client: VirtualNetworkClient,
+    vnic_id: str,
+    new_nsg_id: str,
+    instance_label: Optional[str] = None,
+):
+    """Reassign a VNIC to a single target NSG and delete any NSGs it previously used.
+
+    Ensures a VNIC ends up attached to exactly one Network Security Group. Any
+    NSGs the VNIC was previously attached to (e.g. ones created by older,
+    ad-hoc tooling) are detached and then deleted, so stale rule sets can't
+    coexist with the currently managed NSG.
+
+    Args:
+        virtual_network_client: OCI VirtualNetworkClient instance.
+        vnic_id: OCID of the VNIC to update.
+        new_nsg_id: OCID of the Network Security Group that should be the VNIC's sole NSG.
+        instance_label: Optional display name of the instance/server, used only for logging context.
+
+    Raises:
+        RuntimeError: If retrieving or updating the VNIC fails.
+    """
+    vnic_response = virtual_network_client.get_vnic(vnic_id)
+    if not isinstance(vnic_response, oci.response.Response):
+        raise RuntimeError(f"Failed to retrieve VNIC {vnic_id} for NSG synchronization.")
+    vnic = vnic_response.data
+
+    current_nsg_ids = vnic.nsg_ids or []
+    stale_nsg_ids = [nsg_id for nsg_id in current_nsg_ids if nsg_id != new_nsg_id]
+    label = f" for '{instance_label}'" if instance_label else ""
+
+    if current_nsg_ids != [new_nsg_id]:
+        new_nsg_name = _get_nsg_display_name(virtual_network_client, new_nsg_id)
+        stale_names = [_get_nsg_display_name(virtual_network_client, nsg_id) for nsg_id in stale_nsg_ids]
+
+        logfire.warning(
+            f"NSG drift detected{label}: VNIC {vnic_id} is currently attached to "
+            f"{stale_names or ['<none>']}, expected only '{new_nsg_name}'. Reassigning now."
+        )
+        logfire.info(f"Reassigning VNIC {vnic_id} NSGs: {stale_names or ['<none>']} -> ['{new_nsg_name}']")
+
+        update_response = virtual_network_client.update_vnic(
+            vnic_id,
+            oci.core.models.UpdateVnicDetails(display_name=vnic.display_name, nsg_ids=[new_nsg_id]),
+        )
+        if not isinstance(update_response, oci.response.Response):
+            raise RuntimeError(f"Failed to update VNIC {vnic_id} with NSG {new_nsg_id}.")
+
+        for stale_nsg_id, stale_name in zip(stale_nsg_ids, stale_names):
+            try:
+                logfire.info(f"Deleting superseded Network Security Group '{stale_name}' ({stale_nsg_id}){label}...")
+                virtual_network_client.delete_network_security_group(stale_nsg_id)
+            except oci.exceptions.ServiceError as e:
+                logfire.warning(
+                    f"Could not delete superseded NSG '{stale_name}' ({stale_nsg_id}){label} "
+                    f"(may still be in use): {e.message}"
+                )
 
 
 def setup_internet_routing(
