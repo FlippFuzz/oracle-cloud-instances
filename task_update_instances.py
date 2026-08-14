@@ -22,6 +22,7 @@ from common import (
     get_primary_vnic_id_with_retry,
     get_subnet_id,
     get_supported_shapes_by_ad,
+    get_working_compartment_id,
     load_config,
     log_detailed_service_error,
     merge_server_rules,
@@ -49,6 +50,21 @@ if __name__ == "__main__":
                 if account_name not in sessions:
                     sessions[account_name] = AccountSession.from_account(account_name, OCI_CONFIG_FILE)
                 session = sessions[account_name]
+
+                # 0. Resolve the actual working compartment. Search the compartment subtree for
+                # already-existing instances matching this account's configured servers, so resources
+                # are managed wherever they actually live rather than defaulting to the tenancy root.
+                server_names = {server.name for server in account_config.servers}
+                working_compartment_id = get_working_compartment_id(
+                    session.identity_client, session.compute_client, session.compartment_id, server_names
+                )
+                if working_compartment_id != session.compartment_id:
+                    logfire.info(
+                        f"Account '{account_name}': existing instances found in compartment "
+                        f"{working_compartment_id}. Using it as the working compartment instead of the "
+                        "tenancy root."
+                    )
+                    session.compartment_id = working_compartment_id
 
                 # 1. Dynamically find or configure an IPv6-enabled subnet/VCN
                 subnet_id = get_or_create_ipv6_subnet(

@@ -213,8 +213,6 @@ def main():
 
     print("\n" + "=" * 80)
     print(f"Done. Resized: {resized}  Skipped: {skipped}  Failed: {failed}")
-    if resized:
-        print("Remember to manually reboot the resized instance(s) to apply the new CPU/RAM allocation.")
     print("=" * 80)
 
 

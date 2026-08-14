@@ -378,6 +378,69 @@ def get_supported_shapes_by_ad(
     return shapes_by_ad
 
 
+def get_working_compartment_id(
+    identity_client: IdentityClient,
+    compute_client: ComputeClient,
+    tenancy_compartment_id: str,
+    server_names: set,
+) -> str:
+    """Locate the compartment housing an account's already-deployed servers.
+
+    Searches the full compartment subtree beneath the tenancy for active instances whose
+    display name matches one of the configured server names, and returns the compartment
+    that contains them. This lets management operations target wherever the instances
+    actually live (e.g. a manually-created sub-compartment) instead of assuming the
+    tenancy root. Falls back to the tenancy root compartment when no matching instances
+    are found anywhere, such as for a brand-new account with nothing deployed yet.
+
+    Args:
+        identity_client: OCI IdentityClient instance.
+        compute_client: OCI ComputeClient instance.
+        tenancy_compartment_id: OCID of the tenancy (root compartment).
+        server_names: Set of configured server display names to search for.
+
+    Returns:
+        The OCID of the compartment containing the matching instances, or the tenancy
+        root compartment OCID if none are found.
+    """
+    try:
+        compartments_response = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            tenancy_compartment_id,
+            compartment_id_in_subtree=True,
+        )
+        compartments = compartments_response.data if isinstance(compartments_response, oci.response.Response) else []
+    except Exception as e:
+        logfire.warning(f"Could not list sub-compartments beneath {tenancy_compartment_id}: {e}")
+        compartments = []
+
+    candidate_ids = [tenancy_compartment_id] + [c.id for c in compartments if c.lifecycle_state == "ACTIVE"]
+
+    for compartment_id in candidate_ids:
+        try:
+            list_instances_response = oci.pagination.list_call_get_all_results(
+                compute_client.list_instances, compartment_id
+            )
+        except Exception as e:
+            logfire.warning(f"Could not list instances in compartment {compartment_id}: {e}")
+            continue
+
+        if not isinstance(list_instances_response, oci.response.Response):
+            continue
+
+        for instance in list_instances_response.data:
+            if instance.lifecycle_state in ["TERMINATED", "TERMINATING"]:
+                continue
+            if instance.display_name in server_names:
+                logfire.info(
+                    f"Located existing configured instance '{instance.display_name}' in compartment "
+                    f"{compartment_id}. Using it as the working compartment."
+                )
+                return compartment_id
+
+    return tenancy_compartment_id
+
+
 def get_availability_domain(
     identity_client: IdentityClient,
     compartment_id: str,

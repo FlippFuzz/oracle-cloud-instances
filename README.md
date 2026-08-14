@@ -17,5 +17,14 @@ logfire auth
 logfire projects use starter-project
 
 # Run
+python task_list_instances.py
 python task_update_instances.py
+```
+
+## Useful Commands
+
+### Check region inside the instance
+
+```bash
+curl -s http://169.254.169.254/opc/v1/instance/ | jq -r '.canonicalRegionName'
 ```
